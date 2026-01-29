@@ -27,7 +27,8 @@ ZIO is an async I/O framework for Zig that provides stackful coroutines (fibers/
 15. [std.Io Integration](#stdio-integration)
 16. [Complete Examples](#complete-examples)
 17. [Platform Support](#platform-support)
-18. [FAQ](#faq)
+18. [io_uring Deep Dive](#io_uring-deep-dive)
+19. [FAQ](#faq)
 
 ---
 
@@ -1183,6 +1184,306 @@ defer rt.deinit();
 | Cancelable I/O | Yes | Yes | Stop polling only |
 | Unix sockets | Yes | Win10+ | Yes |
 | Signal handling | Yes | Console events | Yes |
+
+---
+
+## io_uring Deep Dive
+
+This section covers ZIO's io_uring backend in detail, with insights relevant for building high-performance messaging libraries like ZeroMQ.
+
+### ZIO's io_uring Implementation
+
+ZIO uses io_uring on Linux as its primary I/O backend. The implementation is in `src/ev/backends/io_uring.zig`.
+
+#### Initialization Flags
+
+ZIO initializes io_uring with performance-optimized flags:
+
+```zig
+// From ZIO's io_uring.zig
+flags |= linux.IORING_SETUP_SINGLE_ISSUER;   // Single thread submits SQEs
+flags |= linux.IORING_SETUP_DEFER_TASKRUN;   // Defer task work to submission
+flags |= linux.IORING_SETUP_COOP_TASKRUN;    // Cooperative task running
+```
+
+- **SINGLE_ISSUER**: Optimizes for single-threaded SQE submission (common pattern)
+- **DEFER_TASKRUN**: Reduces kernel thread wakeups by deferring work to io_uring_enter
+- **COOP_TASKRUN**: Allows cooperative scheduling of io_uring tasks
+
+#### Supported Operations
+
+ZIO's io_uring backend supports these async operations natively:
+
+| Operation | io_uring Op | Notes |
+|-----------|-------------|-------|
+| TCP connect | `CONNECT` | Non-blocking connection |
+| TCP accept | `ACCEPT` | Accepts new connections |
+| recv/send | `RECVMSG`/`SENDMSG` | Vectored I/O via msghdr |
+| recvfrom/sendto | `RECVMSG`/`SENDMSG` | UDP with address |
+| recvmsg/sendmsg | `RECVMSG`/`SENDMSG` | Full control messages |
+| poll | `POLL_ADD` | Level-triggered readiness |
+| shutdown | `SHUTDOWN` | Socket shutdown |
+| close | `CLOSE` | Async close |
+| File read/write | `READV`/`WRITEV` | Vectored positional I/O |
+| File open/create | `OPENAT` | Async file open |
+| File sync | `FSYNC` | With DATASYNC option |
+| ftruncate | `FTRUNCATE` | Set file size |
+| mkdir | `MKDIRAT` | Create directory |
+| rename | `RENAMEAT` | Atomic rename |
+| unlink | `UNLINKAT` | Delete files/dirs |
+| statx | `STATX` | Extended file stats |
+
+#### Cancellation
+
+ZIO supports true async cancellation via io_uring:
+
+```zig
+// ZIO cancels in-flight operations using IORING_OP_ASYNC_CANCEL
+sqe.prep_cancel(@intFromPtr(target), 0);
+```
+
+This generates two CQEs:
+1. Cancel CQE (result: 0 or -ENOENT)
+2. Target CQE (result: -ECANCELED or natural completion)
+
+#### Wakeup Mechanism
+
+ZIO uses io_uring's `FUTEX_WAIT` operation for efficient cross-thread wakeups:
+
+```zig
+// Wait on wake_requested flag
+sqe.opcode = .FUTEX_WAIT;
+sqe.fd = @bitCast(linux.FUTEX2_FLAGS{ .size = .U32, .private = true });
+
+// Wake from another thread
+linux.futex_3arg(&state.wake_requested.raw, .{ .cmd = .WAKE, .private = true }, 1);
+```
+
+This is more efficient than eventfd for signaling between threads.
+
+### High-Performance Networking Considerations
+
+For building a ZeroMQ-like library with ZIO, here are key considerations:
+
+#### 1. Vectored I/O (Scatter-Gather)
+
+ZIO supports vectored I/O through `ReadBuf` and `WriteBuf`:
+
+```zig
+// Send multiple buffers in one syscall
+const slices = [_][]const u8{ header, payload, trailer };
+_ = try stream.sendVec(rt, &slices, .{});
+
+// Receive into multiple buffers
+var header_buf: [64]u8 = undefined;
+var payload_buf: [4096]u8 = undefined;
+const iovecs = [_]std.posix.iovec{
+    .{ .base = &header_buf, .len = header_buf.len },
+    .{ .base = &payload_buf, .len = payload_buf.len },
+};
+const n = try stream.recvVec(rt, &iovecs, .{});
+```
+
+#### 2. Low-Latency Wakeups
+
+For intra-process signaling (like ZeroMQ's inproc transport), use `zio.Notify`:
+
+```zig
+var notify: zio.Notify = .init;
+
+// Signaling side (can be called from any thread)
+notify.set(rt);
+
+// Waiting side
+try notify.wait(rt);
+```
+
+Or use `zio.Channel` for passing data with backpressure:
+
+```zig
+// Unbuffered channel = synchronous rendezvous (lowest latency)
+var channel = zio.Channel(Message).init(&.{});
+```
+
+#### 3. Timeouts
+
+ZIO integrates timeouts naturally with `select()`:
+
+```zig
+const result = try zio.select(rt, .{
+    .recv = channel.asyncReceive(),
+    .timeout = zio.time.Timeout{ .duration = .fromMilliseconds(100) },
+});
+
+switch (result) {
+    .recv => |val| { /* got message */ },
+    .timeout => { /* timed out */ },
+}
+```
+
+For socket-level timeouts:
+
+```zig
+// Timed operations via select with socket operations
+var recv_op = stream.asyncRecv(&buffer, .{});
+const result = try zio.select(rt, .{
+    .data = &recv_op,
+    .timeout = zio.time.Timeout{ .duration = .fromSeconds(5) },
+});
+```
+
+#### 4. Concurrent Send/Receive
+
+ZIO's coroutine model makes concurrent bidirectional communication natural:
+
+```zig
+fn connectionHandler(rt: *zio.Runtime, stream: zio.net.Stream) !void {
+    defer stream.close(rt);
+
+    var send_queue = zio.Channel(Message).init(&send_buffer);
+    var recv_queue = zio.Channel(Message).init(&recv_buffer);
+
+    var group: zio.Group = .init;
+    defer group.cancel(rt);
+
+    // Spawn concurrent sender and receiver
+    try group.spawn(rt, sendLoop, .{ rt, stream, &send_queue });
+    try group.spawn(rt, recvLoop, .{ rt, stream, &recv_queue });
+
+    try group.wait(rt);
+}
+
+fn sendLoop(rt: *zio.Runtime, stream: zio.net.Stream, queue: *zio.Channel(Message)) !void {
+    while (true) {
+        const msg = try queue.receive(rt);
+        try stream.sendAll(rt, msg.data, .{});
+    }
+}
+
+fn recvLoop(rt: *zio.Runtime, stream: zio.net.Stream, queue: *zio.Channel(Message)) !void {
+    var buffer: [65536]u8 = undefined;
+    while (true) {
+        const n = try stream.recv(rt, &buffer, .{});
+        if (n == 0) break;
+        try queue.send(rt, Message{ .data = buffer[0..n] });
+    }
+}
+```
+
+#### 5. High Throughput Patterns
+
+**Batch Processing with Groups:**
+
+```zig
+fn processBatch(rt: *zio.Runtime, connections: []Connection) !void {
+    var group: zio.Group = .init;
+    defer group.cancel(rt);
+
+    // Launch all operations concurrently
+    for (connections) |conn| {
+        try group.spawn(rt, processOne, .{ rt, conn });
+    }
+
+    // Wait for all to complete
+    try group.wait(rt);
+}
+```
+
+**Multi-threaded Runtime for CPU Parallelism:**
+
+```zig
+const rt = try zio.Runtime.init(allocator, .{
+    .executors = .auto,  // One executor per CPU core
+});
+```
+
+### io_uring Features NOT Currently in ZIO
+
+ZIO's io_uring backend provides a solid foundation, but doesn't expose all advanced io_uring features. If you're building a ZeroMQ-like library and need these, you'd need to extend ZIO or use the ev layer directly.
+
+#### Zero-Copy Networking
+
+io_uring supports [zero-copy send](https://lwn.net/Articles/879724/) which can improve performance by 200%+ over MSG_ZEROCOPY:
+
+- **IORING_OP_SEND_ZC**: Zero-copy send with notification when buffer is safe to reuse
+- **Registered buffers**: Pre-registered buffers eliminate page pinning overhead
+- **ZC Rx (kernel 6.x+)**: [Zero-copy receive](https://docs.kernel.org/networking/iou-zcrx.html) directly into userspace memory
+
+**Status in ZIO:** Not currently implemented. ZIO uses standard RECVMSG/SENDMSG.
+
+#### Multishot Operations
+
+io_uring supports [multishot recv/accept](https://lwn.net/Articles/899498/) which can improve performance by ~8%:
+
+- **Multishot recv**: Single SQE generates multiple CQEs for incoming data
+- **Multishot accept**: Single SQE accepts multiple connections
+- **Provided buffers**: Kernel picks buffers from a pool, reducing submission overhead
+
+**Status in ZIO:** Not currently implemented. Each recv/accept is a single-shot operation.
+
+#### Ring-Mapped Buffers
+
+- **IORING_REGISTER_BUFFERS**: Pre-register buffers to avoid per-operation setup
+- **IORING_REGISTER_FILES**: Pre-register file descriptors (fixed files)
+- **Buffer rings**: Circular buffer pools managed by kernel
+
+**Status in ZIO:** Not currently implemented.
+
+#### SQE Linking
+
+- **IOSQE_IO_LINK**: Chain operations (e.g., read then write)
+- **IOSQE_IO_HARDLINK**: Hard-linked operations (continue even on error)
+- **IOSQE_IO_DRAIN**: Wait for all prior operations to complete
+
+**Status in ZIO:** Not exposed at the high-level API.
+
+### Recommendations for a ZeroMQ-Like Library
+
+Based on ZIO's current capabilities:
+
+| Feature | ZIO Support | Recommendation |
+|---------|-------------|----------------|
+| TCP/UDP | ✅ Full | Use ZIO directly |
+| Unix sockets | ✅ Full | Use ZIO directly |
+| inproc (in-process) | ✅ Via Channel | Use unbuffered Channel |
+| Pub/Sub | ✅ Via BroadcastChannel | Use BroadcastChannel |
+| Request/Reply | ✅ Patterns possible | Build on Channel + Group |
+| Timeouts | ✅ Via select() | Use select() with Timeout |
+| Concurrent I/O | ✅ Via tasks/groups | Spawn tasks per direction |
+| Load balancing | ✅ Multi-executor | Use `.executors = .auto` |
+| Zero-copy | ❌ Not exposed | Would need ZIO extension |
+| Multishot recv | ❌ Not exposed | Would need ZIO extension |
+| Kernel bypass | ❌ Not applicable | Use DPDK/AF_XDP directly |
+
+### Performance Tuning
+
+**Executor Count:**
+```zig
+// For I/O-bound workloads, 1 executor is often sufficient
+.executors = .exact(1)
+
+// For mixed CPU/I/O, match core count
+.executors = .auto
+```
+
+**Stack Size:**
+```zig
+// Default 256KB is conservative; messaging handlers may need less
+.stack_pool = .{
+    .committed_size = 32 * 1024,  // 32KB initial commit
+}
+```
+
+**io_uring Queue Size:**
+The queue size affects how many operations can be in-flight. ZIO uses reasonable defaults, but for extreme throughput you might want to tune this by modifying the backend initialization.
+
+### Further Reading
+
+- [io_uring and networking in 2023](https://github.com/axboe/liburing/wiki/io_uring-and-networking-in-2023) - Comprehensive overview of io_uring networking features
+- [Zero-copy network transmission with io_uring](https://lwn.net/Articles/879724/) - LWN article on zero-copy send
+- [io_uring multishot recv](https://lwn.net/Articles/899498/) - LWN article on multishot operations
+- [Efficient zero-copy networking using io_uring](https://kernel-recipes.org/en/2024/schedule/efficient-zero-copy-networking-using-io_uring/) - Kernel Recipes 2024 presentation
+- [io_uring zero copy Rx](https://docs.kernel.org/networking/iou-zcrx.html) - Kernel documentation on zero-copy receive
 
 ---
 
