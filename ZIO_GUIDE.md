@@ -1445,15 +1445,55 @@ Based on ZIO's current capabilities:
 |---------|-------------|----------------|
 | TCP/UDP | ✅ Full | Use ZIO directly |
 | Unix sockets | ✅ Full | Use ZIO directly |
-| inproc (in-process) | ✅ Via Channel | Use unbuffered Channel |
+| inproc (in-process) | ✅ Via Channel | Use unbuffered Channel for lowest latency |
 | Pub/Sub | ✅ Via BroadcastChannel | Use BroadcastChannel |
 | Request/Reply | ✅ Patterns possible | Build on Channel + Group |
 | Timeouts | ✅ Via select() | Use select() with Timeout |
 | Concurrent I/O | ✅ Via tasks/groups | Spawn tasks per direction |
 | Load balancing | ✅ Multi-executor | Use `.executors = .auto` |
-| Zero-copy | ❌ Not exposed | Would need ZIO extension |
-| Multishot recv | ❌ Not exposed | Would need ZIO extension |
+| Zero-copy | ⚠️ Use workarounds | Buffer pools + large buffers (see below) |
+| Multishot recv | ⚠️ Not critical | ~8% gain; use larger buffers instead |
 | Kernel bypass | ❌ Not applicable | Use DPDK/AF_XDP directly |
+
+#### Why Missing Features Are Often Not Critical
+
+**Zero-copy send (SEND_ZC):** The 200%+ improvement applies vs MSG_ZEROCOPY, not vs regular send. For messages under 16KB, the copy overhead is minimal. Use buffer pooling and large buffers to get most of the benefit.
+
+**Multishot recv:** Only ~8% improvement. You can achieve similar gains by using larger receive buffers (64KB+) which amortizes the per-operation overhead.
+
+**Registered buffers:** Eliminates page pinning overhead, but userspace buffer pooling eliminates allocation overhead which is often the larger cost.
+
+#### Recommended Architecture for High-Performance Messaging
+
+```zig
+const MessagingSocket = struct {
+    stream: zio.net.Stream,
+    recv_pool: *BufferPool,
+    send_pool: *BufferPool,
+    send_batcher: MessageBatcher,
+
+    pub fn send(self: *MessagingSocket, rt: *zio.Runtime, msg: []const u8) !void {
+        // Coalesce small messages
+        if (msg.len < 1024 and self.send_batcher.add(msg)) {
+            if (self.send_batcher.shouldFlush()) {
+                try self.send_batcher.flush(rt, self.stream);
+            }
+            return;
+        }
+        // Large messages: send directly with pooled buffer if needed
+        try self.stream.sendAll(rt, msg, .{});
+    }
+
+    pub fn recv(self: *MessagingSocket, rt: *zio.Runtime) ![]u8 {
+        const buf = self.recv_pool.acquire() orelse
+            return error.NoBuffersAvailable;
+        errdefer self.recv_pool.release(buf);
+
+        const n = try self.stream.recv(rt, buf, .{});
+        if (n == 0) return error.ConnectionClosed;
+        return buf[0..n];
+    }
+};
 
 ### Performance Tuning
 
@@ -1475,7 +1515,138 @@ Based on ZIO's current capabilities:
 ```
 
 **io_uring Queue Size:**
-The queue size affects how many operations can be in-flight. ZIO uses reasonable defaults, but for extreme throughput you might want to tune this by modifying the backend initialization.
+The queue size affects how many operations can be in-flight. ZIO uses a default of 256 entries. For extreme throughput you can adjust this via `Loop.Options.queue_size`.
+
+**LIFO Slot Optimization:**
+ZIO enables a LIFO slot optimization by default (`.lifo_slot_enabled = true`) which allows newly spawned tasks to run immediately on the same executor, improving cache locality for request-response patterns.
+
+### Userspace Workarounds for Missing Features
+
+Since ZIO doesn't expose registered buffers or zero-copy APIs, here are effective userspace alternatives:
+
+#### Buffer Pooling
+
+Avoid allocation overhead by reusing buffers:
+
+```zig
+const BufferPool = struct {
+    free_list: std.ArrayList([]u8),
+    allocator: std.mem.Allocator,
+    buffer_size: usize,
+
+    pub fn init(allocator: std.mem.Allocator, count: usize, size: usize) !BufferPool {
+        var pool = BufferPool{
+            .free_list = std.ArrayList([]u8).init(allocator),
+            .allocator = allocator,
+            .buffer_size = size,
+        };
+        for (0..count) |_| {
+            const buf = try allocator.alloc(u8, size);
+            try pool.free_list.append(buf);
+        }
+        return pool;
+    }
+
+    pub fn acquire(self: *BufferPool) ?[]u8 {
+        return self.free_list.popOrNull();
+    }
+
+    pub fn release(self: *BufferPool, buf: []u8) void {
+        self.free_list.append(buf) catch {
+            self.allocator.free(buf);
+        };
+    }
+};
+```
+
+#### Message Coalescing
+
+Reduce syscall overhead by batching small messages:
+
+```zig
+const MessageBatcher = struct {
+    buffer: []u8,
+    offset: usize = 0,
+    flush_threshold: usize,
+
+    pub fn add(self: *MessageBatcher, msg: []const u8) bool {
+        if (self.offset + msg.len > self.buffer.len) return false;
+        @memcpy(self.buffer[self.offset..][0..msg.len], msg);
+        self.offset += msg.len;
+        return true;
+    }
+
+    pub fn shouldFlush(self: *const MessageBatcher) bool {
+        return self.offset >= self.flush_threshold;
+    }
+
+    pub fn flush(self: *MessageBatcher, rt: *zio.Runtime, stream: zio.net.Stream) !void {
+        if (self.offset > 0) {
+            try stream.sendAll(rt, self.buffer[0..self.offset], .{});
+            self.offset = 0;
+        }
+    }
+};
+```
+
+#### Larger Buffers
+
+Amortize per-operation overhead with larger buffers (benefits diminish after ~64KB):
+
+```zig
+// Good: Large buffer reduces syscalls per byte
+var buffer: [65536]u8 = undefined;
+const n = try stream.recv(rt, &buffer, .{});
+
+// Less efficient: Many small reads
+var small_buf: [1024]u8 = undefined;
+// Each recv has fixed overhead regardless of size
+```
+
+### Understanding ZIO's Architecture
+
+For advanced users, understanding ZIO's internal architecture helps with optimization:
+
+#### Completion Model
+
+ZIO uses a **1:1 SQE:CQE model** - each submitted operation produces exactly one completion. This is important because:
+
+- Every `recv()`/`send()` call submits one io_uring SQE
+- The coroutine suspends until the CQE arrives
+- No batching of completions at the io_uring level
+
+This means for very high message rates, consider:
+- Batching at the application level (message coalescing)
+- Using larger buffers to reduce operation count
+- Using vectored I/O to send multiple buffers per syscall
+
+#### The ev Layer
+
+ZIO's async operations flow through these layers:
+
+```
+High-level API (zio.net.Stream)
+       ↓
+Runtime (task scheduling)
+       ↓
+ev/loop.zig (completion management)
+       ↓
+ev/backends/io_uring.zig (SQE submission)
+```
+
+For very advanced use cases, you can access the ev layer directly:
+
+```zig
+// Access the underlying loop (advanced)
+const loop = rt.executor.loop;
+
+// The loop processes completions via tick()
+// Each backend (io_uring, epoll, iocp) implements submit() and poll()
+```
+
+#### Cross-Thread Wakeups
+
+ZIO's cross-thread signaling uses io_uring's `FUTEX_WAIT`/`FUTEX_WAKE` operations, which are more efficient than eventfd. This makes `zio.Notify` and cross-thread channel operations very fast.
 
 ### Further Reading
 
