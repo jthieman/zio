@@ -1,0 +1,1240 @@
+# ZIO - Complete Guide
+
+**Version:** 0.5.1 (zig-0.16 branch)
+**Zig Compatibility:** 0.16.0+
+**License:** MIT
+
+ZIO is an async I/O framework for Zig that provides stackful coroutines (fibers/green threads) with a runtime that makes asynchronous operations look synchronous. It's similar to Go's goroutines but implemented in Zig with manual memory management.
+
+---
+
+## Table of Contents
+
+1. [Overview](#overview)
+2. [Installation](#installation)
+3. [Core Concepts](#core-concepts)
+4. [Runtime](#runtime)
+5. [Tasks](#tasks)
+6. [Groups](#groups)
+7. [Networking](#networking)
+8. [File I/O](#file-io)
+9. [Synchronization Primitives](#synchronization-primitives)
+10. [Channels](#channels)
+11. [Select](#select)
+12. [Signals](#signals)
+13. [Time](#time)
+14. [Error Handling & Cancellation](#error-handling--cancellation)
+15. [std.Io Integration](#stdio-integration)
+16. [Complete Examples](#complete-examples)
+17. [Platform Support](#platform-support)
+18. [FAQ](#faq)
+
+---
+
+## Overview
+
+ZIO provides:
+
+- **Stackful coroutines** - User-mode context switching for `x86_64`, `aarch64`, `riscv64`, and `loongarch64`
+- **Async I/O** - Operations look blocking but use event-driven OS APIs (`io_uring`, `epoll`, `iocp`, `kqueue`, `poll`)
+- **Multi-threaded scheduler** - Run tasks across multiple CPU threads with automatic load balancing
+- **Synchronization primitives** - `Mutex`, `Condition`, `Semaphore`, `Channel`, `Barrier`, etc.
+- **Cancellation support** - All operations can be canceled
+- **std.Io integration** - Works with Zig standard library interfaces
+
+### How It Works
+
+1. You create a `Runtime` that manages one or more executor threads
+2. You `spawn()` tasks (coroutines) that run concurrently
+3. When a task performs I/O or waits, it suspends and other tasks run
+4. The scheduler multiplexes thousands of tasks onto a few OS threads
+
+---
+
+## Installation
+
+### 1. Add ZIO to `build.zig.zon`
+
+```bash
+zig fetch --save "git+https://github.com/lalinsky/zio#zig-0.16"
+```
+
+### 2. Configure `build.zig`
+
+```zig
+const zio = b.dependency("zio", .{
+    .target = target,
+    .optimize = optimize,
+});
+
+exe.root_module.addImport("zio", zio.module("zio"));
+```
+
+---
+
+## Core Concepts
+
+### Imports
+
+```zig
+const std = @import("std");
+const zio = @import("zio");
+```
+
+### Public Types
+
+| Type | Description |
+|------|-------------|
+| `zio.Runtime` | Main runtime that manages executors and tasks |
+| `zio.JoinHandle(T)` | Handle to wait for/cancel a spawned task |
+| `zio.Group` | Structured concurrency for managing multiple tasks |
+| `zio.net.*` | Networking types (Stream, Socket, IpAddress, etc.) |
+| `zio.File` / `zio.Dir` | File system operations |
+| `zio.Mutex` | Async-aware mutual exclusion lock |
+| `zio.Condition` | Condition variable for signaling |
+| `zio.Semaphore` | Counting semaphore |
+| `zio.Channel(T)` | Bounded FIFO channel for task communication |
+| `zio.BroadcastChannel(T)` | Multi-producer multi-consumer broadcast channel |
+| `zio.Barrier` | Synchronization barrier |
+| `zio.Notify` | One-shot notification |
+| `zio.ResetEvent` | Manual/auto reset event |
+| `zio.Future(T)` | One-shot value container |
+| `zio.Signal` | OS signal handler |
+| `zio.time.Duration` | Time duration |
+| `zio.time.Timestamp` | Point in time |
+| `zio.time.Stopwatch` | High-performance timer |
+
+---
+
+## Runtime
+
+The `Runtime` is the core of ZIO. It manages the event loop, task scheduling, and resource pools.
+
+### Creating a Runtime
+
+```zig
+var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+defer _ = gpa.deinit();
+
+const rt = try zio.Runtime.init(gpa.allocator(), .{});
+defer rt.deinit();
+```
+
+### Runtime Options
+
+```zig
+const rt = try zio.Runtime.init(allocator, .{
+    // Number of executor threads (default: 1 = single-threaded)
+    .executors = .exact(4),  // or .auto for CPU count
+
+    // Stack pool configuration
+    .stack_pool = .{
+        .maximum_size = 8 * 1024 * 1024,  // 8MB reserved per stack
+        .committed_size = 64 * 1024,       // 64KB initial commit
+        .max_unused_stacks = 16,
+        .max_age = .fromSeconds(60),
+    },
+
+    // LIFO slot optimization (default: true)
+    .lifo_slot_enabled = true,
+});
+```
+
+### Runtime Methods
+
+```zig
+// Spawn a new task
+var handle = try rt.spawn(myFunction, .{ arg1, arg2 });
+
+// Spawn a blocking task (runs in thread pool)
+var handle = try rt.spawnBlocking(blockingFunction, .{ arg1 });
+
+// Sleep the current task
+try rt.sleep(.fromMilliseconds(100));
+
+// Yield to other tasks
+try rt.yield();
+
+// Get current monotonic time
+const now = rt.now();
+
+// Cancellation shield (prevent cancel during critical section)
+rt.beginShield();
+defer rt.endShield();
+
+// Check if canceled
+try rt.checkCancel();
+
+// Get std.Io interface
+const io = rt.io();
+```
+
+---
+
+## Tasks
+
+Tasks are the fundamental unit of concurrency in ZIO. They're stackful coroutines that suspend when waiting and resume when ready.
+
+### Spawning Tasks
+
+```zig
+fn myTask(rt: *zio.Runtime, value: i32) !i32 {
+    try rt.sleep(.fromMilliseconds(100));
+    return value * 2;
+}
+
+// Spawn and get a handle
+var handle = try rt.spawn(myTask, .{ rt, 21 });
+
+// Wait for result
+const result = handle.join(rt);  // Returns 42
+```
+
+### Task Return Types
+
+Tasks can return any type, including error unions:
+
+```zig
+// Void task
+fn voidTask() void { }
+
+// Value-returning task
+fn valueTask() i32 { return 42; }
+
+// Error-returning task
+fn errorTask() !void { return error.SomethingFailed; }
+
+// Error union with value
+fn errorValueTask() !i32 { return 42; }
+
+// With Cancelable error
+fn cancelableTask(rt: *zio.Runtime) zio.Cancelable!void {
+    try rt.sleep(.fromSeconds(10));
+}
+```
+
+### JoinHandle Operations
+
+```zig
+var handle = try rt.spawn(myTask, .{ rt });
+
+// Wait for completion and get result
+const result = handle.join(rt);
+
+// Cancel the task and wait
+handle.cancel(rt);
+
+// Detach (fire and forget)
+handle.detach(rt);
+
+// Check if result is available
+if (handle.hasResult()) {
+    const result = handle.getResult();
+}
+```
+
+### Common Pattern: Cancel in Defer
+
+```zig
+var handle = try rt.spawn(myTask, .{ rt });
+defer handle.cancel(rt);  // Safe even after join()
+
+const result = handle.join(rt);
+```
+
+### Stack Size
+
+Default stack size is 256 KiB. Configure for tasks needing more:
+
+```zig
+// Note: Stack size is set via the task closure, not spawn options
+// The default is usually sufficient for most tasks
+```
+
+---
+
+## Groups
+
+Groups provide structured concurrency - spawn multiple tasks and wait for all to complete.
+
+### Basic Usage
+
+```zig
+var group: zio.Group = .init;
+defer group.cancel(rt);  // Cancel any remaining tasks
+
+// Spawn tasks into the group
+try group.spawn(rt, task1, .{ rt });
+try group.spawn(rt, task2, .{ rt });
+try group.spawn(rt, task3, .{ rt });
+
+// Wait for all to complete
+try group.wait(rt);
+
+// Check if any task failed
+if (group.hasFailed()) {
+    // Handle failure
+}
+```
+
+### Error Handling in Groups
+
+When a task in a group returns an error:
+- If it returns `error.Canceled`, the group's `isCanceled()` flag is set
+- For any other error, the group's `hasFailed()` flag is set
+
+```zig
+fn worker(rt: *zio.Runtime) !void {
+    try doWork();  // If this fails, group.hasFailed() becomes true
+}
+
+var group: zio.Group = .init;
+defer group.cancel(rt);
+
+for (0..10) |_| {
+    try group.spawn(rt, worker, .{rt});
+}
+
+try group.wait(rt);
+if (group.hasFailed()) {
+    std.log.err("One or more workers failed", .{});
+}
+```
+
+### Blocking Tasks in Groups
+
+```zig
+try group.spawnBlocking(rt, blockingWork, .{ data });
+```
+
+---
+
+## Networking
+
+ZIO provides high-level networking with full async support.
+
+### IP Addresses
+
+```zig
+// Parse IPv4
+const addr = try zio.net.IpAddress.parseIp4("127.0.0.1", 8080);
+
+// Parse IPv6
+const addr6 = try zio.net.IpAddress.parseIp6("::1", 8080);
+
+// Parse either
+const addr = try zio.net.IpAddress.parseIp("192.168.1.1", 8080);
+
+// Parse with port string
+const addr = try zio.net.IpAddress.parseIpAndPort("127.0.0.1:8080");
+
+// Unspecified (0.0.0.0)
+const addr = zio.net.IpAddress.unspecified(8080);
+```
+
+### TCP Server
+
+```zig
+const addr = try zio.net.IpAddress.parseIp4("127.0.0.1", 8080);
+const server = try addr.listen(rt, .{});
+defer server.close(rt);
+
+std.log.info("Listening on {f}", .{server.socket.address});
+
+var group: zio.Group = .init;
+defer group.cancel(rt);
+
+while (true) {
+    const stream = try server.accept(rt);
+    errdefer stream.close(rt);
+
+    try group.spawn(rt, handleClient, .{ rt, stream });
+}
+```
+
+### TCP Client
+
+```zig
+const addr = try zio.net.IpAddress.parseIp4("127.0.0.1", 8080);
+var stream = try addr.connect(rt, .{});
+defer stream.close(rt);
+```
+
+### Stream I/O
+
+```zig
+fn handleClient(rt: *zio.Runtime, stream: zio.net.Stream) !void {
+    defer stream.close(rt);
+    defer stream.shutdown(rt, .both) catch {};
+
+    // Buffered reader/writer
+    var read_buffer: [4096]u8 = undefined;
+    var reader = stream.reader(rt, &read_buffer);
+
+    var write_buffer: [4096]u8 = undefined;
+    var writer = stream.writer(rt, &write_buffer);
+
+    // Read a line
+    const line = reader.interface.takeDelimiterInclusive('\n') catch |err| switch (err) {
+        error.EndOfStream => return,
+        else => return err,
+    };
+
+    // Write response
+    try writer.interface.writeAll(line);
+    try writer.interface.flush();
+}
+```
+
+### UDP
+
+```zig
+const addr = try zio.net.IpAddress.parseIp4("127.0.0.1", 8080);
+const socket = try addr.bind(rt, .{});
+defer socket.close(rt);
+
+var buffer: [1024]u8 = undefined;
+
+while (true) {
+    const result = try socket.receiveFrom(rt, &buffer);
+    std.log.info("Received {d} bytes from {f}", .{ result.len, result.from });
+
+    _ = try socket.sendTo(rt, result.from, buffer[0..result.len]);
+}
+```
+
+### DNS Resolution
+
+```zig
+const hostname = try zio.net.HostName.init("example.com");
+var iter = try hostname.lookup(rt, .{ .port = 80 });
+defer iter.deinit();
+
+while (iter.next()) |result| {
+    switch (result) {
+        .address => |addr| std.log.info("Address: {f}", .{addr}),
+        .canonical_name => |name| std.log.info("Canonical: {s}", .{name.bytes}),
+    }
+}
+
+// Or connect directly
+var stream = try hostname.connect(rt, 80, .{});
+```
+
+---
+
+## File I/O
+
+File I/O is truly asynchronous on Linux and Windows, simulated via thread pool on other platforms.
+
+### Opening Files
+
+```zig
+// Open existing file
+var file = try zio.openFile(rt, "path/to/file.txt");
+defer file.close(rt);
+
+// Create new file
+var file = try zio.createFile(rt, "path/to/file.txt", .{});
+defer file.close(rt);
+
+// With directory handle
+const dir = zio.Dir.cwd();
+var file = try dir.openFile(rt, "file.txt", .{ .mode = .read_only });
+```
+
+### Reading and Writing
+
+```zig
+// Positional read
+var buf: [1024]u8 = undefined;
+const n = try file.read(rt, &buf, 0);  // Read at offset 0
+
+// Positional write
+const written = try file.write(rt, "Hello, World!", 0);
+
+// Vectored I/O
+const slices = [_][]const u8{ "Hello, ", "World!" };
+_ = try file.writeVec(rt, &slices, 0);
+```
+
+### File Reader/Writer (std.Io Interface)
+
+```zig
+var read_buffer: [256]u8 = undefined;
+var reader = file.reader(rt, &read_buffer);
+
+var result: [20]u8 = undefined;
+const bytes_read = try reader.interface.readSliceShort(&result);
+
+var write_buffer: [256]u8 = undefined;
+var writer = file.writer(rt, &write_buffer);
+try writer.interface.writeAll("Hello!");
+try writer.interface.flush();
+```
+
+### Directory Operations
+
+```zig
+// Create directory
+try zio.createDir(rt, "newdir", 0o755);
+
+// Delete directory
+try zio.deleteDir(rt, "olddir");
+
+// Delete file
+try zio.deleteFile(rt, "file.txt");
+
+// Rename
+try zio.rename(rt, "old.txt", "new.txt");
+
+// File stats
+const info = try zio.stat(rt, "file.txt");
+std.log.info("Size: {d}, Mode: {o}", .{ info.size, info.mode });
+
+// Check access
+try zio.access(rt, "file.txt", .{ .read = true });
+```
+
+### Symbolic and Hard Links
+
+```zig
+// Create symlink
+try dir.symLink(rt, "target.txt", "link.txt", .{});
+
+// Read symlink
+var buf: [256]u8 = undefined;
+const target = try dir.readLink(rt, "link.txt", &buf);
+
+// Create hard link
+try dir.hardLink(rt, "original.txt", dir, "hardlink.txt", .{});
+```
+
+---
+
+## Synchronization Primitives
+
+All synchronization primitives are async-aware and will suspend the current task instead of blocking the thread.
+
+### Mutex
+
+```zig
+var mutex: zio.Mutex = .init;
+
+try mutex.lock(rt);
+defer mutex.unlock(rt);
+
+// Critical section
+shared_data += 1;
+```
+
+Non-blocking try:
+
+```zig
+if (mutex.tryLock()) {
+    defer mutex.unlock(rt);
+    // Got the lock
+}
+```
+
+Uncancelable lock (for cleanup operations):
+
+```zig
+mutex.lockUncancelable(rt);
+defer mutex.unlock(rt);
+```
+
+### Condition Variable
+
+```zig
+var mutex: zio.Mutex = .init;
+var cond: zio.Condition = .init;
+var ready = false;
+
+// Waiting side
+try mutex.lock(rt);
+while (!ready) {
+    try cond.wait(rt, &mutex);
+}
+mutex.unlock(rt);
+
+// Signaling side
+try mutex.lock(rt);
+ready = true;
+cond.signal(rt);
+mutex.unlock(rt);
+```
+
+### Semaphore
+
+```zig
+var sem = zio.Semaphore{ .permits = 3 };
+
+// Acquire permit (blocks if none available)
+try sem.wait(rt);
+defer sem.post(rt);
+
+// Do work with limited concurrency
+```
+
+Timed wait:
+
+```zig
+sem.timedWait(rt, .fromMilliseconds(100)) catch |err| {
+    if (err == error.Timeout) {
+        // Handle timeout
+    }
+};
+```
+
+### Barrier
+
+```zig
+var barrier = zio.Barrier{ .threshold = 4 };
+
+// In each of 4 tasks:
+try barrier.wait(rt);  // All tasks must reach here before any proceed
+```
+
+### Notify
+
+One-shot notification:
+
+```zig
+var notify: zio.Notify = .init;
+
+// Waiting side
+try notify.wait(rt);
+
+// Signaling side
+notify.set(rt);
+```
+
+### ResetEvent
+
+```zig
+var event: zio.ResetEvent = .init;
+
+// Wait for event
+try event.wait(rt);
+
+// Signal event
+event.set(rt);
+
+// Reset for reuse
+event.reset();
+```
+
+### Future
+
+One-shot value container:
+
+```zig
+var future = zio.Future(i32).init;
+
+// Setting side
+future.set(42);
+
+// Waiting side (in select or directly)
+const value = try zio.wait(rt, &future);
+```
+
+---
+
+## Channels
+
+Channels provide communication between tasks with optional buffering.
+
+### Creating Channels
+
+```zig
+// Buffered channel (capacity = buffer length)
+var buffer: [8]i32 = undefined;
+var channel = zio.Channel(i32).init(&buffer);
+
+// Unbuffered channel (synchronous rendezvous)
+var channel = zio.Channel(i32).init(&.{});
+```
+
+### Sending and Receiving
+
+```zig
+// Send (blocks if full)
+try channel.send(rt, 42);
+
+// Receive (blocks if empty)
+const value = try channel.receive(rt);
+```
+
+Non-blocking:
+
+```zig
+// Try send
+channel.trySend(99) catch |err| switch (err) {
+    error.ChannelFull => { /* handle */ },
+    error.ChannelClosed => { /* handle */ },
+};
+
+// Try receive
+const value = channel.tryReceive() catch |err| switch (err) {
+    error.ChannelEmpty => { /* handle */ },
+    error.ChannelClosed => { /* handle */ },
+};
+```
+
+### Closing Channels
+
+```zig
+// Graceful close - receivers can drain remaining items
+channel.close(.graceful);
+
+// Immediate close - clears all buffered items
+channel.close(.immediate);
+```
+
+### Producer-Consumer Example
+
+```zig
+fn producer(rt: *zio.Runtime, ch: *zio.Channel(i32)) !void {
+    for (0..10) |i| {
+        try ch.send(rt, @intCast(i));
+    }
+}
+
+fn consumer(rt: *zio.Runtime, ch: *zio.Channel(i32)) !void {
+    while (true) {
+        const value = ch.receive(rt) catch |err| switch (err) {
+            error.ChannelClosed => break,
+            else => return err,
+        };
+        std.log.info("Received: {}", .{value});
+    }
+}
+```
+
+---
+
+## Select
+
+`select()` waits for multiple operations and returns whichever completes first.
+
+### Basic Usage
+
+```zig
+var task1 = try rt.spawn(slowTask, .{rt});
+defer task1.cancel(rt);
+
+var task2 = try rt.spawn(fastTask, .{rt});
+defer task2.cancel(rt);
+
+const result = try zio.select(rt, .{
+    .slow = &task1,
+    .fast = &task2,
+});
+
+switch (result) {
+    .slow => |val| std.log.info("Slow won: {}", .{val}),
+    .fast => |val| std.log.info("Fast won: {}", .{val}),
+}
+```
+
+### With Channels
+
+```zig
+const result = try zio.select(rt, .{
+    .recv = channel.asyncReceive(),
+    .timeout = zio.time.Timeout{ .duration = .fromSeconds(5) },
+});
+
+switch (result) {
+    .recv => |val| {
+        const value = try val;  // Handle potential ChannelClosed error
+        std.log.info("Received: {}", .{value});
+    },
+    .timeout => {
+        std.log.info("Timed out", .{});
+    },
+}
+```
+
+### With Signals
+
+```zig
+var sigint = try zio.Signal.init(.INT);
+defer sigint.deinit();
+
+var sigterm = try zio.Signal.init(.TERM);
+defer sigterm.deinit();
+
+const result = try zio.select(rt, .{
+    .sigint = &sigint,
+    .sigterm = &sigterm,
+});
+
+switch (result) {
+    .sigint => std.log.info("Received SIGINT", .{}),
+    .sigterm => std.log.info("Received SIGTERM", .{}),
+}
+```
+
+### Wait for Single Future
+
+```zig
+// Using wait() for a single future
+const result = try zio.wait(rt, &future);
+const value = result.value;
+
+// waitUntilComplete never returns error.Canceled
+const value = zio.waitUntilComplete(rt, &future);
+```
+
+---
+
+## Signals
+
+Handle OS signals (Unix) or console control events (Windows).
+
+### Creating Signal Handlers
+
+```zig
+var sig = try zio.Signal.init(.INT);  // SIGINT / Ctrl+C
+defer sig.deinit();
+
+// Wait for signal
+try sig.wait(rt);
+std.log.info("Received signal!", .{});
+```
+
+### Available Signal Types
+
+**Unix:** All `std.posix.SIG` values (INT, TERM, USR1, USR2, etc.)
+
+**Windows:**
+- `.INT` - Ctrl+C (CTRL_C_EVENT)
+- `.TERM` - Console close (CTRL_CLOSE_EVENT)
+
+### Timed Wait
+
+```zig
+sig.timedWait(rt, .fromSeconds(5)) catch |err| switch (err) {
+    error.Timeout => std.log.info("No signal received", .{}),
+    else => return err,
+};
+```
+
+### Graceful Shutdown Example
+
+```zig
+fn signalHandler(rt: *zio.Runtime, shutdown: *std.atomic.Value(bool)) !void {
+    var sig = try zio.Signal.init(.INT);
+    defer sig.deinit();
+
+    try sig.wait(rt);
+    std.log.info("Shutdown requested", .{});
+    shutdown.store(true, .release);
+}
+
+fn serverTask(rt: *zio.Runtime, shutdown: *std.atomic.Value(bool)) !void {
+    while (!shutdown.load(.acquire)) {
+        // Do work
+        try rt.sleep(.fromMilliseconds(100));
+    }
+    std.log.info("Server shutting down", .{});
+}
+
+var shutdown = std.atomic.Value(bool).init(false);
+var group: zio.Group = .init;
+defer group.cancel(rt);
+
+try group.spawn(rt, serverTask, .{ rt, &shutdown });
+try group.spawn(rt, signalHandler, .{ rt, &shutdown });
+
+try group.wait(rt);
+```
+
+---
+
+## Time
+
+### Duration
+
+```zig
+const d1 = zio.time.Duration.fromNanoseconds(1000);
+const d2 = zio.time.Duration.fromMicroseconds(500);
+const d3 = zio.time.Duration.fromMilliseconds(100);
+const d4 = zio.time.Duration.fromSeconds(5);
+const d5 = zio.time.Duration.fromMinutes(2);
+
+// Convert back
+const ms = d3.toMilliseconds();  // 100
+
+// Parse from string (Go-style)
+const d = try zio.time.Duration.parse("1h30m45s");
+
+// Format
+std.log.info("Duration: {f}", .{d});  // "1h30m45s"
+```
+
+### Timestamp
+
+```zig
+// Current monotonic time
+const now = rt.now();
+
+// Duration between timestamps
+const elapsed = start.durationTo(end);
+
+// Add/subtract duration
+const later = now.addDuration(.fromSeconds(10));
+const earlier = now.subDuration(.fromSeconds(5));
+
+// Format
+std.log.info("Time: {f}", .{now});  // "2024-01-15 12:40:45"
+```
+
+### Stopwatch
+
+```zig
+var timer = zio.time.Stopwatch.start();
+
+// Do work...
+
+const elapsed = timer.read();
+std.log.info("Took {f}", .{elapsed});
+
+// Reset
+timer.reset();
+
+// Lap (read and reset)
+const lap = timer.lap();
+```
+
+### Timeout
+
+Used with `select()`:
+
+```zig
+const result = try zio.select(rt, .{
+    .work = &workFuture,
+    .timeout = zio.time.Timeout{ .duration = .fromSeconds(5) },
+});
+```
+
+---
+
+## Error Handling & Cancellation
+
+### Cancelable Error Type
+
+Many ZIO operations can return `error.Canceled`:
+
+```zig
+pub const Cancelable = error{Canceled};
+
+fn myTask(rt: *zio.Runtime) zio.Cancelable!void {
+    try rt.sleep(.fromSeconds(10));  // Returns error.Canceled if task is canceled
+}
+```
+
+### Handling Cancellation
+
+```zig
+fn handleClient(rt: *zio.Runtime, stream: zio.net.Stream) !void {
+    defer stream.close(rt);  // Always closes, even on cancel
+
+    while (true) {
+        const data = stream.read(rt, &buf) catch |err| switch (err) {
+            error.Canceled => {
+                std.log.info("Task canceled, cleaning up", .{});
+                return error.Canceled;  // Propagate cancellation
+            },
+            else => return err,
+        };
+        // Process data...
+    }
+}
+```
+
+### Cancellation Shielding
+
+Prevent cancellation during critical sections:
+
+```zig
+rt.beginShield();
+defer rt.endShield();
+
+// This code cannot be interrupted by cancellation
+try doImportantCleanup();
+
+// After endShield(), check if we were canceled
+try rt.checkCancel();  // Throws error.Canceled if we were
+```
+
+### Uncancelable Operations
+
+Some operations have "uncancelable" variants for cleanup:
+
+```zig
+// Always acquires lock, even if canceled
+mutex.lockUncancelable(rt);
+defer mutex.unlock(rt);
+```
+
+---
+
+## std.Io Integration
+
+ZIO implements `std.Io.Reader` and `std.Io.Writer` interfaces.
+
+### Getting std.Io from Runtime
+
+```zig
+const io = rt.io();
+
+// Use with std.http.Server
+var server = std.http.Server.init(&reader.interface, &writer.interface);
+```
+
+### Stream Reader/Writer
+
+```zig
+var read_buffer: [4096]u8 = undefined;
+var reader = stream.reader(rt, &read_buffer);
+
+var write_buffer: [4096]u8 = undefined;
+var writer = stream.writer(rt, &write_buffer);
+
+// reader.interface and writer.interface are std.Io types
+```
+
+### HTTP Server Example
+
+```zig
+fn handleClient(rt: *zio.Runtime, stream: zio.net.Stream) !void {
+    defer stream.close(rt);
+
+    var read_buffer: [64 * 1024]u8 = undefined;
+    var reader = stream.reader(rt, &read_buffer);
+
+    var write_buffer: [4096]u8 = undefined;
+    var writer = stream.writer(rt, &write_buffer);
+
+    var server = std.http.Server.init(&reader.interface, &writer.interface);
+
+    while (true) {
+        var request = server.receiveHead() catch break;
+
+        const html = "<html><body><h1>Hello!</h1></body></html>";
+        try request.respond(html, .{
+            .status = .ok,
+            .extra_headers = &.{
+                .{ .name = "content-type", .value = "text/html" },
+            },
+        });
+
+        if (!request.head.keep_alive) break;
+    }
+}
+```
+
+---
+
+## Complete Examples
+
+### TCP Echo Server
+
+```zig
+const std = @import("std");
+const zio = @import("zio");
+
+fn handleClient(rt: *zio.Runtime, stream: zio.net.Stream) !void {
+    defer stream.close(rt);
+    defer stream.shutdown(rt, .both) catch {};
+
+    var read_buffer: [1024]u8 = undefined;
+    var reader = stream.reader(rt, &read_buffer);
+
+    var write_buffer: [1024]u8 = undefined;
+    var writer = stream.writer(rt, &write_buffer);
+
+    while (true) {
+        const line = reader.interface.takeDelimiterInclusive('\n') catch |err| switch (err) {
+            error.EndOfStream => break,
+            else => return err,
+        };
+        try writer.interface.writeAll(line);
+        try writer.interface.flush();
+    }
+}
+
+pub fn main() !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+
+    const rt = try zio.Runtime.init(gpa.allocator(), .{});
+    defer rt.deinit();
+
+    const addr = try zio.net.IpAddress.parseIp4("127.0.0.1", 8080);
+    const server = try addr.listen(rt, .{});
+    defer server.close(rt);
+
+    std.log.info("Listening on {f}", .{server.socket.address});
+
+    var group: zio.Group = .init;
+    defer group.cancel(rt);
+
+    while (true) {
+        const stream = try server.accept(rt);
+        errdefer stream.close(rt);
+        try group.spawn(rt, handleClient, .{ rt, stream });
+    }
+}
+```
+
+### Producer-Consumer with Channels
+
+```zig
+const std = @import("std");
+const zio = @import("zio");
+
+fn producer(rt: *zio.Runtime, channel: *zio.Channel(i32), id: u32) !void {
+    for (0..5) |i| {
+        const item: i32 = @intCast(id * 100 + i);
+        channel.send(rt, item) catch |err| switch (err) {
+            error.ChannelClosed => return,
+            error.Canceled => return,
+        };
+        std.log.info("Producer {}: sent {}", .{ id, item });
+    }
+}
+
+fn consumer(rt: *zio.Runtime, channel: *zio.Channel(i32), id: u32) !void {
+    while (true) {
+        const item = channel.receive(rt) catch |err| switch (err) {
+            error.ChannelClosed => return,
+            error.Canceled => return,
+        };
+        std.log.info("Consumer {}: received {}", .{ id, item });
+        try rt.sleep(.fromMilliseconds(100));
+    }
+}
+
+pub fn main() !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+
+    var rt = try zio.Runtime.init(gpa.allocator(), .{});
+    defer rt.deinit();
+
+    var buffer: [8]i32 = undefined;
+    var channel = zio.Channel(i32).init(&buffer);
+
+    var group: zio.Group = .init;
+    defer group.cancel(rt);
+
+    // Start producers and consumers
+    for (0..2) |i| {
+        try group.spawn(rt, producer, .{ rt, &channel, @intCast(i) });
+        try group.spawn(rt, consumer, .{ rt, &channel, @intCast(i) });
+    }
+
+    try group.wait(rt);
+}
+```
+
+### Multi-threaded Runtime
+
+```zig
+const rt = try zio.Runtime.init(allocator, .{
+    .executors = .auto,  // Use all CPU cores
+});
+defer rt.deinit();
+
+// Tasks automatically distribute across executor threads
+```
+
+---
+
+## Platform Support
+
+### Operating Systems
+
+| OS | Event Backend | File I/O | Notes |
+|----|---------------|----------|-------|
+| Linux | io_uring, epoll | Async | Full support |
+| Windows | IOCP | Async | Full support |
+| macOS | kqueue | Thread pool | BSD socket API |
+| FreeBSD/OpenBSD | kqueue | Thread pool | Should work |
+| Others | poll | Thread pool | Fallback |
+
+### Architectures
+
+- `x86_64` - Full support
+- `aarch64` - Full support
+- `riscv64` - Full support
+- `loongarch64` - Full support
+
+### Features by Platform
+
+| Feature | Linux | Windows | macOS |
+|---------|-------|---------|-------|
+| Async network I/O | Yes | Yes | Yes |
+| True async file I/O | Yes (io_uring) | Yes (IOCP) | Via thread pool |
+| Cancelable I/O | Yes | Yes | Stop polling only |
+| Unix sockets | Yes | Win10+ | Yes |
+| Signal handling | Yes | Console events | Yes |
+
+---
+
+## FAQ
+
+### How is this different from other Zig async I/O projects?
+
+ZIO provides:
+- Complete cross-platform support (Linux, Windows, macOS)
+- Thread pool for blocking operations with coroutine integration
+- Advanced synchronization primitives (channels, barriers, etc.)
+- Full cancellation support
+- `std.Io` interface compatibility
+
+### What about the future std.Io interface?
+
+ZIO implements `std.Io.Reader` and `std.Io.Writer`. When Zig 0.16 is released with the full `std.Io` interface, ZIO will be one implementation of it.
+
+### How do I handle errors in spawned tasks?
+
+Tasks can return error unions. Use `join()` to get the result:
+
+```zig
+var handle = try rt.spawn(mayFailTask, .{});
+const result = handle.join(rt);  // Returns error union
+const value = try result;  // Propagate error or get value
+```
+
+### Can I use ZIO with existing blocking code?
+
+Yes, use `spawnBlocking()` for CPU-intensive or blocking operations:
+
+```zig
+var handle = try rt.spawnBlocking(blockingOperation, .{ args });
+const result = handle.join(rt);
+```
+
+### What's the maximum number of concurrent tasks?
+
+Limited primarily by memory (each task needs a stack). The default 256KB stack means ~4000 tasks per GB of RAM. You can reduce stack size for tasks that don't need deep call stacks.
+
+### How do I debug deadlocks?
+
+- Ensure all `lock()` calls have matching `unlock()` (use `defer`)
+- Don't wait on yourself (ZIO detects this with a panic)
+- Use Groups for structured concurrency instead of manual task management
+- Consider using `tryLock()` with timeouts for debugging
+
+---
+
+## Resources
+
+- **GitHub:** https://github.com/lalinsky/zio
+- **Example Project:** https://github.com/lalinsky/zio-mini-redis
+- **HTTP Library:** https://github.com/lalinsky/dusty
